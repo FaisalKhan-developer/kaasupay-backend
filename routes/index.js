@@ -1,3 +1,4 @@
+
 const express = require("express");
 
 const userRouter = require("./user");
@@ -6,6 +7,7 @@ const transactionsRouter = require("./transactions");
 const adminRouter = require("./admin");
 const walletRouter = require("./wallet");
 const withdrawalsRouter = require("./withdrawals");
+const requestsRouter = require("./requests");
 
 const router = express.Router();
 
@@ -22,5 +24,8 @@ router.use("/wallet/add-money", addMoneyRouter);
 
 // Withdrawal and bank account routes
 router.use("/wallet", withdrawalsRouter);
+
+// Request Money routes
+router.use("/requests", requestsRouter);
 
 module.exports = router;

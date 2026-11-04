@@ -4,6 +4,8 @@ const JWT_SECRET = process.env.JWT_SECRET;
 const RAZORPAY_KEY_ID = process.env.RAZORPAY_KEY_ID;
 const RAZORPAY_KEY_SECRET = process.env.RAZORPAY_KEY_SECRET;
 const RAZORPAY_WEBHOOK_SECRET = process.env.RAZORPAY_WEBHOOK_SECRET;
+const REQUEST_EXPIRY_DAYS = 7;
+
 
 if (!JWT_SECRET) {
   throw new Error("Missing JWT_SECRET environment variable");
@@ -22,4 +24,6 @@ module.exports = {
   RAZORPAY_KEY_ID,
   RAZORPAY_KEY_SECRET,
   RAZORPAY_WEBHOOK_SECRET,
+  REQUEST_EXPIRY_DAYS,
+
 };

@@ -10,6 +10,7 @@ const BankAccount = require("../models/bankAccount");
 const Withdrawal = require("../models/Withdrawal");
 const OutboxEvent = require("../models/OutboxEvent");
 const DailySpend = require("../models/DailySpend");
+const MoneyRequest = require("../models/MoneyRequest");
 
 // Daily outgoing limit: ₹10,000 = 1,000,000 paise
 const DAILY_LIMIT = 1000000;
@@ -260,6 +261,285 @@ async function transferMoney({
     await session.endSession();
   }
 }
+
+
+async function payMoneyRequest({
+  payerId,
+  requestId,
+  idempotencyKey,
+}) {
+  const session = await mongoose.startSession();
+
+  try {
+    let result;
+
+    await session.withTransaction(async () => {
+      const requestHash = crypto
+        .createHash("sha256")
+        .update(`REQUEST_PAYMENT:${requestId}`)
+        .digest("hex");
+
+      // Check idempotency first.
+      const existing = await IdempotencyRecord.findOne({
+        userId: payerId,
+        key: idempotencyKey,
+      }).session(session);
+
+      if (existing) {
+        if (existing.requestHash !== requestHash) {
+          const error = new Error(
+            "Idempotency key already used for a different request"
+          );
+          error.status = 409;
+          throw error;
+        }
+
+        if (existing.state === "DONE") {
+          result = {
+            status: existing.responseStatus,
+            body: existing.responseBody,
+          };
+          return;
+        }
+
+        const error = new Error("Request is already being processed");
+        error.status = 409;
+        throw error;
+      }
+
+      const request = await MoneyRequest.findById(requestId)
+        .session(session);
+
+      if (!request) {
+        const error = new Error("Money request not found");
+        error.status = 404;
+        throw error;
+      }
+
+      if (request.requesterId.toString() === payerId.toString()) {
+        const error = new Error("You cannot pay your own request");
+        error.status = 403;
+        throw error;
+      }
+
+      if (request.payerId.toString() !== payerId.toString()) {
+        const error = new Error("You are not authorized to pay this request");
+        error.status = 403;
+        throw error;
+      }
+
+      if (request.status !== "PENDING") {
+        const error = new Error(
+          `Request is already ${request.status}`
+        );
+        error.status = 409;
+        throw error;
+      }
+
+      const now = new Date();
+
+      if (request.expiresAt <= now) {
+        await MoneyRequest.updateOne(
+          { _id: request._id, status: "PENDING" },
+          {
+            $set: {
+              status: "EXPIRED",
+              decidedAt: now,
+            },
+          },
+          { session }
+        );
+
+        result = {
+          status: 410,
+          body: { error: "Money request has expired" },
+        };
+        return;
+      }
+
+      // Atomically claim the request.
+      const paidRequest = await MoneyRequest.findOneAndUpdate(
+        {
+          _id: requestId,
+          payerId,
+          status: "PENDING",
+          expiresAt: { $gt: now },
+        },
+        {
+          $set: {
+            status: "PAID",
+            decidedAt: now,
+          },
+        },
+        {
+          new: true,
+          session,
+        }
+      );
+
+      if (!paidRequest) {
+        const latest = await MoneyRequest.findById(requestId)
+          .session(session);
+
+        if (
+          latest &&
+          latest.status === "PENDING" &&
+          latest.expiresAt <= now
+        ) {
+          await MoneyRequest.updateOne(
+            { _id: requestId, status: "PENDING" },
+            {
+              $set: {
+                status: "EXPIRED",
+                decidedAt: now,
+              },
+            },
+            { session }
+          );
+
+          result = {
+            status: 410,
+            body: { error: "Money request has expired" },
+          };
+          return;
+        }
+
+        const error = new Error("Request is no longer pending");
+        error.status = 409;
+        throw error;
+      }
+
+      // Create idempotency record in the same transaction.
+      await IdempotencyRecord.create(
+        [
+          {
+            userId: payerId,
+            key: idempotencyKey,
+            requestHash,
+            state: "IN_PROGRESS",
+          },
+        ],
+        { session }
+      );
+
+      const amount = paidRequest.amount;
+
+      await reserveDailySpend(payerId, amount, session);
+
+      const payerWallet = await Wallet.findOneAndUpdate(
+        {
+          user: payerId,
+          balance: { $gte: amount },
+        },
+        {
+          $inc: { balance: -amount },
+        },
+        {
+          new: true,
+          session,
+          runValidators: true,
+        }
+      );
+
+      if (!payerWallet) {
+        const error = new Error("Insufficient wallet balance");
+        error.status = 400;
+        throw error;
+      }
+
+      const requesterWallet = await Wallet.findOneAndUpdate(
+        { user: paidRequest.requesterId },
+        {
+          $inc: { balance: amount },
+        },
+        {
+          new: true,
+          session,
+          runValidators: true,
+        }
+      );
+
+      if (!requesterWallet) {
+        const error = new Error("Requester wallet not found");
+        error.status = 404;
+        throw error;
+      }
+
+      const [transaction] = await Transaction.create(
+        [
+          {
+            type: "TRANSFER",
+            fromUserId: payerId,
+            toUserId: paidRequest.requesterId,
+            amount,
+            note: `Request: ${paidRequest.note || "Money request"}`.slice(0, 50),
+            status: "SUCCESS",
+          },
+        ],
+        { session }
+      );
+
+      await LedgerEntry.create(
+        [
+          {
+            userId: payerId,
+            transactionId: transaction._id,
+            direction: "DEBIT",
+            amount,
+            balanceAfter: payerWallet.balance,
+          },
+          {
+            userId: paidRequest.requesterId,
+            transactionId: transaction._id,
+            direction: "CREDIT",
+            amount,
+            balanceAfter: requesterWallet.balance,
+          },
+        ],
+        { session, ordered: true }
+      );
+
+      await MoneyRequest.updateOne(
+        { _id: paidRequest._id, status: "PAID" },
+        {
+          $set: { transactionId: transaction._id },
+        },
+        { session }
+      );
+
+      result = {
+        status: 200,
+        body: {
+          message: "Money request paid successfully",
+          transactionId: transaction._id.toString(),
+          requestId: paidRequest._id.toString(),
+          amount,
+          balance: payerWallet.balance,
+        },
+      };
+
+      await IdempotencyRecord.updateOne(
+        {
+          userId: payerId,
+          key: idempotencyKey,
+        },
+        {
+          $set: {
+            state: "DONE",
+            responseStatus: result.status,
+            responseBody: result.body,
+          },
+        },
+        { session }
+      );
+    });
+
+    return result;
+  } finally {
+    await session.endSession();
+  }
+}
+
 
 // ================= REQUEST WITHDRAWAL =================
 
@@ -578,4 +858,5 @@ module.exports = {
   transferMoney,
   requestWithdrawal,
   reverseWithdrawal,
+  payMoneyRequest,
 };
