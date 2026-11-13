@@ -80,18 +80,19 @@ async function creditTopUp({
       );
 
       // Step 5: Record the wallet credit in the ledger.
-      await LedgerEntry.create(
-        [
-          {
-            userId: paymentOrder.userId,
-            transactionId: transaction._id,
-            direction: "CREDIT",
-            amount: paymentOrder.amount,
-            balanceAfter: wallet.balance,
-          },
-        ],
-        { session }
-      );
+await LedgerEntry.create(
+  [
+    {
+      userId: paymentOrder.userId,
+      transactionId: transaction._id,
+      type: "TOPUP",
+      direction: "CREDIT",
+      amount: paymentOrder.amount,
+      balanceAfter: wallet.balance,
+    },
+  ],
+  { session }
+);
 
       // Step 6: Link the transaction to the payment order.
       paymentOrder.transactionId = transaction._id;

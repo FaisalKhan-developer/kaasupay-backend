@@ -7,6 +7,8 @@ const User = require("../models/User");
 const Wallet = require("../models/Wallet");
 const DailySpend = require("../models/DailySpend");
 const { createRateLimiter } = require("../middleware/rateLimiter");
+const mongoose = require("mongoose");
+const LedgerEntry = require("../models/LedgerEntry");
 
 const { transferMoney } = require("../services/money");
 const { checkPin } = require("../services/pin");
@@ -207,6 +209,201 @@ router.get("/limits", async (req, res) => {
 
     return res.status(500).json({
       error: "Unable to fetch daily spending limit",
+    });
+  }
+});
+
+// ================= MONTHLY STATEMENT =================
+
+router.get("/statement", async (req, res) => {
+  try {
+    const month = req.query.month;
+
+    if (
+      typeof month !== "string" ||
+      !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)
+    ) {
+      return res.status(400).json({
+        error: "Provide month in YYYY-MM format",
+      });
+    }
+
+    const [year, monthNumber] = month.split("-").map(Number);
+
+    // India month boundaries converted to UTC.
+    const startDate = new Date(
+      Date.UTC(year, monthNumber - 1, 1) - 330 * 60 * 1000
+    );
+
+    const endDate = new Date(
+      Date.UTC(year, monthNumber, 1) - 330 * 60 * 1000
+    );
+
+    const userId = new mongoose.Types.ObjectId(req.user.userId);
+
+    // Balance immediately before the selected month.
+    const openingEntry = await LedgerEntry.findOne({
+      userId,
+      createdAt: { $lt: startDate },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("balanceAfter")
+      .lean();
+
+    const openingBalance = openingEntry?.balanceAfter || 0;
+
+    // Calculate monthly credits and debits.
+    const totals = await LedgerEntry.aggregate([
+      {
+        $match: {
+          userId,
+          createdAt: {
+            $gte: startDate,
+            $lt: endDate,
+          },
+        },
+      },
+      {
+        $group: {
+          _id: "$direction",
+          total: { $sum: "$amount" },
+          count: { $sum: 1 },
+        },
+      },
+    ]);
+
+    let totalIn = 0;
+    let totalOut = 0;
+    let transactionCount = 0;
+
+    for (const item of totals) {
+      if (item._id === "CREDIT") totalIn = item.total;
+      if (item._id === "DEBIT") totalOut = item.total;
+
+      transactionCount += item.count;
+    }
+
+    // Latest balance at or before the end of the selected month.
+    const closingEntry = await LedgerEntry.findOne({
+      userId,
+      createdAt: { $lt: endDate },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("balanceAfter")
+      .lean();
+
+    const closingBalance = closingEntry?.balanceAfter ?? openingBalance;
+
+    const calculatedBalance = openingBalance + totalIn - totalOut;
+
+    return res.status(200).json({
+      month,
+      openingBalance,
+      totalIn,
+      totalOut,
+      closingBalance,
+      transactionCount,
+      reconciled: calculatedBalance === closingBalance,
+      currency: "INR",
+      unit: "paise",
+    });
+
+  } catch (error) {
+    console.error("Monthly statement error:", error);
+
+    return res.status(500).json({
+      error: "Failed to generate monthly statement",
+    });
+  }
+});
+
+// ================= MONTHLY STATEMENT CSV =================
+
+router.get("/statement/csv", async (req, res) => {
+  try {
+    const month = req.query.month;
+
+    if (
+      typeof month !== "string" ||
+      !/^\d{4}-(0[1-9]|1[0-2])$/.test(month)
+    ) {
+      return res.status(400).json({
+        error: "Provide month in YYYY-MM format",
+      });
+    }
+
+    const [year, monthNumber] = month.split("-").map(Number);
+
+    const startDate = new Date(
+      Date.UTC(year, monthNumber - 1, 1) - 330 * 60 * 1000
+    );
+
+    const endDate = new Date(
+      Date.UTC(year, monthNumber, 1) - 330 * 60 * 1000
+    );
+
+    const entries = await LedgerEntry.find({
+      userId: req.user.userId,
+      createdAt: {
+        $gte: startDate,
+        $lt: endDate,
+      },
+    })
+      .sort({ createdAt: -1, _id: -1 })
+      .select("type direction amount balanceAfter createdAt transactionId")
+      .populate({
+        path: "transactionId",
+        select: "note",
+      })
+      .lean();
+
+    // Escape CSV values and prevent spreadsheet formula injection.
+    const escapeCSV = (value) => {
+      let text = String(value ?? "");
+
+      if (/^[\s]*[=+\-@]/.test(text)) {
+        text = "'" + text;
+      }
+
+      return `"${text.replace(/"/g, '""')}"`;
+    };
+
+    const rows = [
+      [
+        "Date",
+        "Type",
+        "Direction",
+        "Amount (paise)",
+        "Balance After (paise)",
+        "Note",
+      ],
+      ...entries.map((entry) => [
+        entry.createdAt.toISOString(),
+        entry.type,
+        entry.direction,
+        entry.amount,
+        entry.balanceAfter,
+        entry.transactionId?.note || "",
+      ]),
+    ];
+
+    const csv = rows
+      .map((row) => row.map(escapeCSV).join(","))
+      .join("\r\n");
+
+    res.setHeader("Content-Type", "text/csv; charset=utf-8");
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="kaasupay-statement-${month}.csv"`
+    );
+
+    return res.status(200).send("\uFEFF" + csv);
+
+  } catch (error) {
+    console.error("CSV statement error:", error);
+
+    return res.status(500).json({
+      error: "Failed to download statement",
     });
   }
 });

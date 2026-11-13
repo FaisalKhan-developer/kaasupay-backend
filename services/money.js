@@ -214,6 +214,7 @@ async function transferMoney({
           {
             userId: fromUserId,
             transactionId: transaction._id,
+            type: "TRANSFER",
             direction: "DEBIT",
             amount,
             balanceAfter: senderWallet.balance,
@@ -221,6 +222,7 @@ async function transferMoney({
           {
             userId: recipient._id,
             transactionId: transaction._id,
+            type: "TRANSFER",
             direction: "CREDIT",
             amount,
             balanceAfter: recipientWallet.balance,
@@ -484,6 +486,7 @@ async function payMoneyRequest({
           {
             userId: payerId,
             transactionId: transaction._id,
+            type: "TRANSFER",
             direction: "DEBIT",
             amount,
             balanceAfter: payerWallet.balance,
@@ -491,6 +494,7 @@ async function payMoneyRequest({
           {
             userId: paidRequest.requesterId,
             transactionId: transaction._id,
+            type: "TRANSFER",
             direction: "CREDIT",
             amount,
             balanceAfter: requesterWallet.balance,
@@ -690,6 +694,7 @@ async function requestWithdrawal({
           {
             userId,
             transactionId: transaction._id,
+            type: "WITHDRAWAL",
             direction: "DEBIT",
             amount,
             balanceAfter: wallet.balance,
@@ -821,6 +826,7 @@ async function reverseWithdrawal({
           {
             userId: withdrawal.userId,
             transactionId: transaction._id,
+            type: "REVERSAL",
             direction: "CREDIT",
             amount: withdrawal.amount,
             balanceAfter: wallet.balance,

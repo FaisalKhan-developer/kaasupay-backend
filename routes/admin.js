@@ -96,18 +96,19 @@ router.post("/deposit", verifyAdmin, async (req, res) => {
         { session }
       );
 
-      await LedgerEntry.create(
-        [
-          {
-            userId: user._id,
-            transactionId: transaction._id,
-            direction: "CREDIT",
-            amount,
-            balanceAfter: wallet.balance,
-          },
-        ],
-        { session }
-      );
+await LedgerEntry.create(
+  [
+    {
+      userId: user._id,
+      transactionId: transaction._id,
+      type: "DEPOSIT",
+      direction: "CREDIT",
+      amount,
+      balanceAfter: wallet.balance,
+    },
+  ],
+  { session }
+);
 
       result = {
         message: "Deposit successful",
