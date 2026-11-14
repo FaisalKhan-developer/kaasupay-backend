@@ -91,20 +91,24 @@ async function reserveDailySpend(userId, amount, session) {
 
 // ================= TRANSFER MONEY =================
 
+
 async function transferMoney({
   fromUserId,
   to,
   amount,
   note,
   idempotencyKey,
+  session: externalSession = null,
+  skipReward = false,
 }) {
-  const session = await mongoose.startSession();
+  const ownsSession = !externalSession;
+  const session = externalSession || await mongoose.startSession();
 
   try {
     let result;
-      let rewardData = null;
+    let rewardData = null;
 
-    await session.withTransaction(async () => {
+    const executeTransfer = async () => {
       const recipient = await User.findOne({
         username: to.trim().toLowerCase(),
       }).session(session);
@@ -154,9 +158,7 @@ async function transferMoney({
           return;
         }
 
-        const error = new Error(
-          "Request is already being processed"
-        );
+        const error = new Error("Request is already being processed");
         error.status = 409;
         throw error;
       }
@@ -173,9 +175,10 @@ async function transferMoney({
         { session }
       );
 
-      // Apply daily limit before moving money.
+      // Apply daily spending limit.
       await reserveDailySpend(fromUserId, amount, session);
 
+      // Deduct from sender wallet.
       const senderWallet = await Wallet.findOneAndUpdate(
         {
           user: fromUserId,
@@ -197,6 +200,7 @@ async function transferMoney({
         throw error;
       }
 
+      // Credit recipient wallet.
       const recipientWallet = await Wallet.findOneAndUpdate(
         { user: recipient._id },
         {
@@ -215,29 +219,29 @@ async function transferMoney({
         throw error;
       }
 
-const [transaction] = await Transaction.create(
-  [
-    {
-      type: "TRANSFER",
-      fromUserId,
-      toUserId: recipient._id,
-      amount,
-      note: note || "",
-      status: "SUCCESS",
-    },
-  ],
-  { session
-   }
-);
-rewardData = {
-  userId: fromUserId,
-  receiverId: recipient._id,
-  transactionId: transaction._id,
-  amount,
-};
+      // Create transaction.
+      const [transaction] = await Transaction.create(
+        [
+          {
+            type: "TRANSFER",
+            fromUserId,
+            toUserId: recipient._id,
+            amount,
+            note: note || "",
+            status: "SUCCESS",
+          },
+        ],
+        { session }
+      );
 
-     
+      rewardData = {
+        userId: fromUserId,
+        receiverId: recipient._id,
+        transactionId: transaction._id,
+        amount,
+      };
 
+      // Create ledger entries.
       await LedgerEntry.create(
         [
           {
@@ -271,6 +275,7 @@ rewardData = {
         },
       };
 
+      // Save idempotency response.
       await IdempotencyRecord.updateOne(
         {
           userId: fromUserId,
@@ -285,17 +290,27 @@ rewardData = {
         },
         { session }
       );
-    });
+    };
 
-    if (rewardData) {
+    if (ownsSession) {
+      await session.withTransaction(executeTransfer);
+    } else {
+      await executeTransfer();
+    }
+
+    // Cashback runs only after an independently owned transaction.
+    if (rewardData && !skipReward && ownsSession) {
       await tryCreateRewardCard(rewardData);
     }
 
     return result;
   } finally {
-    await session.endSession();
+    if (ownsSession) {
+      await session.endSession();
+    }
   }
 }
+
 
 
 async function payMoneyRequest({

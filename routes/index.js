@@ -9,7 +9,8 @@ const walletRouter = require("./wallet");
 const withdrawalsRouter = require("./withdrawals");
 const requestsRouter = require("./requests");
 const rewardsRouter = require("./rewards");
-
+const autopayRouter = require("./autopay");
+const cronRouter = require("./cron");
 const router = express.Router();
 
 // User routes
@@ -30,5 +31,9 @@ router.use("/wallet", withdrawalsRouter);
 router.use("/requests", requestsRouter);
 
 router.use("/rewards", rewardsRouter);
+
+router.use("/autopay", autopayRouter);
+
+router.use("/cron", cronRouter);
 
 module.exports = router;
