@@ -116,6 +116,11 @@ router.post("/signup", signupLimiter, async (req, res) => {
     }
 
     const { username, firstName, lastName, password } = result.data;
+    if (username === "kaasupay-promo@system.internal") {
+  return res.status(400).json({
+    error: "This username is reserved",
+  });
+}
 
     const existing = await User.findOne({ username });
 
@@ -198,6 +203,11 @@ router.post(
       const { username, password } = result.data;
 
       const user = await User.findOne({ username });
+      if (username === "kaasupay-promo@system.internal") {
+  return res.status(401).json({
+    error: "Wrong email or password",
+  });
+}
 
       if (!user) {
         return res.status(401).json({

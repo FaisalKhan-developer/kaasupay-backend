@@ -11,6 +11,25 @@ const Withdrawal = require("../models/Withdrawal");
 const OutboxEvent = require("../models/OutboxEvent");
 const DailySpend = require("../models/DailySpend");
 const MoneyRequest = require("../models/MoneyRequest");
+const { createRewardCard } = require("./rewards");
+
+async function tryCreateRewardCard(data) {
+  const session = await mongoose.startSession();
+
+  try {
+    await session.withTransaction(async () => {
+      await createRewardCard({
+        ...data,
+        session,
+      });
+    });
+  } catch (error) {
+    // Cashback failure must never cancel a successful payment.
+    console.error("Cashback generation skipped:", error.message);
+  } finally {
+    await session.endSession();
+  }
+}
 
 // Daily outgoing limit: ₹10,000 = 1,000,000 paise
 const DAILY_LIMIT = 1000000;
@@ -83,6 +102,7 @@ async function transferMoney({
 
   try {
     let result;
+      let rewardData = null;
 
     await session.withTransaction(async () => {
       const recipient = await User.findOne({
@@ -195,19 +215,28 @@ async function transferMoney({
         throw error;
       }
 
-      const [transaction] = await Transaction.create(
-        [
-          {
-            type: "TRANSFER",
-            fromUserId,
-            toUserId: recipient._id,
-            amount,
-            note: note || "",
-            status: "SUCCESS",
-          },
-        ],
-        { session }
-      );
+const [transaction] = await Transaction.create(
+  [
+    {
+      type: "TRANSFER",
+      fromUserId,
+      toUserId: recipient._id,
+      amount,
+      note: note || "",
+      status: "SUCCESS",
+    },
+  ],
+  { session
+   }
+);
+rewardData = {
+  userId: fromUserId,
+  receiverId: recipient._id,
+  transactionId: transaction._id,
+  amount,
+};
+
+     
 
       await LedgerEntry.create(
         [
@@ -258,6 +287,10 @@ async function transferMoney({
       );
     });
 
+    if (rewardData) {
+      await tryCreateRewardCard(rewardData);
+    }
+
     return result;
   } finally {
     await session.endSession();
@@ -274,6 +307,7 @@ async function payMoneyRequest({
 
   try {
     let result;
+    let rewardData = null;
 
     await session.withTransaction(async () => {
       const requestHash = crypto
@@ -301,6 +335,7 @@ async function payMoneyRequest({
             status: existing.responseStatus,
             body: existing.responseBody,
           };
+          
           return;
         }
 
@@ -467,19 +502,26 @@ async function payMoneyRequest({
         throw error;
       }
 
-      const [transaction] = await Transaction.create(
-        [
-          {
-            type: "TRANSFER",
-            fromUserId: payerId,
-            toUserId: paidRequest.requesterId,
-            amount,
-            note: `Request: ${paidRequest.note || "Money request"}`.slice(0, 50),
-            status: "SUCCESS",
-          },
-        ],
-        { session }
-      );
+const [transaction] = await Transaction.create(
+  [
+    {
+      type: "TRANSFER",
+      fromUserId: payerId,
+      toUserId: paidRequest.requesterId,
+      amount,
+      note: `Request: ${paidRequest.note || "Money request"}`.slice(0, 50),
+      status: "SUCCESS",
+    },
+  ],
+  { session }
+);
+
+rewardData = {
+  userId: payerId,
+  receiverId: paidRequest.requesterId,
+  transactionId: transaction._id,
+  amount,
+};
 
       await LedgerEntry.create(
         [
@@ -537,6 +579,10 @@ async function payMoneyRequest({
         { session }
       );
     });
+
+    if (rewardData) {
+  await tryCreateRewardCard(rewardData);
+}
 
     return result;
   } finally {

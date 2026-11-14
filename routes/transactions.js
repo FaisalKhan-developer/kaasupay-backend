@@ -14,6 +14,7 @@ const TYPES = [
   "TOPUP",
   "WITHDRAWAL",
   "REVERSAL",
+  "CASHBACK",
 ];
 
 function indiaDateStart(dateString) {

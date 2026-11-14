@@ -8,6 +8,7 @@ const adminRouter = require("./admin");
 const walletRouter = require("./wallet");
 const withdrawalsRouter = require("./withdrawals");
 const requestsRouter = require("./requests");
+const rewardsRouter = require("./rewards");
 
 const router = express.Router();
 
@@ -27,5 +28,7 @@ router.use("/wallet", withdrawalsRouter);
 
 // Request Money routes
 router.use("/requests", requestsRouter);
+
+router.use("/rewards", rewardsRouter);
 
 module.exports = router;

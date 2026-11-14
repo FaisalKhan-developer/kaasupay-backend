@@ -15,13 +15,14 @@ const ledgerEntrySchema = new mongoose.Schema(
     },
     type: {
       type: String,
-      enum: [
-        "TRANSFER",
-        "DEPOSIT",
-        "TOPUP",
-        "WITHDRAWAL",
-        "REVERSAL",
-      ],
+enum: [
+  "TRANSFER",
+  "DEPOSIT",
+  "TOPUP",
+  "WITHDRAWAL",
+  "REVERSAL",
+  "CASHBACK",
+],
       required: true,
     },
     direction: {
