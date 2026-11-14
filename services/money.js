@@ -1,4 +1,3 @@
-
 const mongoose = require("mongoose");
 const crypto = require("crypto");
 
@@ -10,15 +9,106 @@ const IdempotencyRecord = require("../models/IdempotencyRecord");
 const BankAccount = require("../models/bankAccount");
 const Withdrawal = require("../models/Withdrawal");
 const OutboxEvent = require("../models/OutboxEvent");
+const DailySpend = require("../models/DailySpend");
+const MoneyRequest = require("../models/MoneyRequest");
+const { createRewardCard } = require("./rewards");
 
-async function transferMoney({ fromUserId, to, amount, note, idempotencyKey }) {
+async function tryCreateRewardCard(data) {
   const session = await mongoose.startSession();
 
   try {
-    let result;
-
     await session.withTransaction(async () => {
-      // Find the recipient
+      await createRewardCard({
+        ...data,
+        session,
+      });
+    });
+  } catch (error) {
+    // Cashback failure must never cancel a successful payment.
+    console.error("Cashback generation skipped:", error.message);
+  } finally {
+    await session.endSession();
+  }
+}
+
+// Daily outgoing limit: ₹10,000 = 1,000,000 paise
+const DAILY_LIMIT = 1000000;
+
+// India timezone: UTC + 5:30
+function getIndiaDay() {
+  const indiaTime = new Date(Date.now() + 330 * 60 * 1000);
+  return indiaTime.toISOString().slice(0, 10);
+}
+
+// Reserve daily spending inside the current MongoDB transaction.
+async function reserveDailySpend(userId, amount, session) {
+  const day = getIndiaDay();
+
+  // Create today's counter if it does not exist.
+  await DailySpend.updateOne(
+    { userId, day },
+    {
+      $setOnInsert: {
+        spent: 0,
+      },
+    },
+    {
+      upsert: true,
+      session,
+    }
+  );
+
+  // Atomically increase spending only if the limit allows it.
+  const updated = await DailySpend.findOneAndUpdate(
+    {
+      userId,
+      day,
+      spent: {
+        $lte: DAILY_LIMIT - amount,
+      },
+    },
+    {
+      $inc: {
+        spent: amount,
+      },
+    },
+    {
+      new: true,
+      session,
+    }
+  );
+
+  if (!updated) {
+    const error = new Error(
+      "Daily outgoing limit of ₹10,000 exceeded"
+    );
+    error.status = 400;
+    throw error;
+  }
+
+  return updated;
+}
+
+// ================= TRANSFER MONEY =================
+
+
+async function transferMoney({
+  fromUserId,
+  to,
+  amount,
+  note,
+  idempotencyKey,
+  session: externalSession = null,
+  skipReward = false,
+}) {
+  const ownsSession = !externalSession;
+  const session = externalSession || await mongoose.startSession();
+
+  try {
+    let result;
+    let rewardData = null;
+
+    const executeTransfer = async () => {
       const recipient = await User.findOne({
         username: to.trim().toLowerCase(),
       }).session(session);
@@ -35,17 +125,17 @@ async function transferMoney({ fromUserId, to, amount, note, idempotencyKey }) {
         throw error;
       }
 
-      // Create a hash of the request for idempotency checks
       const requestHash = crypto
         .createHash("sha256")
-        .update(JSON.stringify({
-          to: recipient._id.toString(),
-          amount,
-          note: note || "",
-        }))
+        .update(
+          JSON.stringify({
+            to: recipient._id.toString(),
+            amount,
+            note: note || "",
+          })
+        )
         .digest("hex");
 
-      // Check if this request key has already been used
       const existing = await IdempotencyRecord.findOne({
         userId: fromUserId,
         key: idempotencyKey,
@@ -74,22 +164,29 @@ async function transferMoney({ fromUserId, to, amount, note, idempotencyKey }) {
       }
 
       await IdempotencyRecord.create(
-        [{
-          userId: fromUserId,
-          key: idempotencyKey,
-          requestHash,
-          state: "IN_PROGRESS",
-        }],
+        [
+          {
+            userId: fromUserId,
+            key: idempotencyKey,
+            requestHash,
+            state: "IN_PROGRESS",
+          },
+        ],
         { session }
       );
 
-      // Deduct money only if the sender has enough balance
+      // Apply daily spending limit.
+      await reserveDailySpend(fromUserId, amount, session);
+
+      // Deduct from sender wallet.
       const senderWallet = await Wallet.findOneAndUpdate(
         {
           user: fromUserId,
           balance: { $gte: amount },
         },
-        { $inc: { balance: -amount } },
+        {
+          $inc: { balance: -amount },
+        },
         {
           new: true,
           session,
@@ -103,10 +200,12 @@ async function transferMoney({ fromUserId, to, amount, note, idempotencyKey }) {
         throw error;
       }
 
-      // Add money to the recipient's wallet
+      // Credit recipient wallet.
       const recipientWallet = await Wallet.findOneAndUpdate(
         { user: recipient._id },
-        { $inc: { balance: amount } },
+        {
+          $inc: { balance: amount },
+        },
         {
           new: true,
           session,
@@ -120,39 +219,50 @@ async function transferMoney({ fromUserId, to, amount, note, idempotencyKey }) {
         throw error;
       }
 
-      // Create the transaction
+      // Create transaction.
       const [transaction] = await Transaction.create(
-        [{
-          type: "TRANSFER",
-          fromUserId,
-          toUserId: recipient._id,
-          amount,
-          note: note || "",
-          status: "SUCCESS",
-        }],
+        [
+          {
+            type: "TRANSFER",
+            fromUserId,
+            toUserId: recipient._id,
+            amount,
+            note: note || "",
+            status: "SUCCESS",
+          },
+        ],
         { session }
       );
 
-      // Record both sides in the ledger
-await LedgerEntry.create(
-  [
-    {
-      userId: fromUserId,
-      transactionId: transaction._id,
-      direction: "DEBIT",
-      amount,
-      balanceAfter: senderWallet.balance,
-    },
-    {
-      userId: recipient._id,
-      transactionId: transaction._id,
-      direction: "CREDIT",
-      amount,
-      balanceAfter: recipientWallet.balance,
-    },
-  ],
-  { session, ordered: true }
-);
+      rewardData = {
+        userId: fromUserId,
+        receiverId: recipient._id,
+        transactionId: transaction._id,
+        amount,
+      };
+
+      // Create ledger entries.
+      await LedgerEntry.create(
+        [
+          {
+            userId: fromUserId,
+            transactionId: transaction._id,
+            type: "TRANSFER",
+            direction: "DEBIT",
+            amount,
+            balanceAfter: senderWallet.balance,
+          },
+          {
+            userId: recipient._id,
+            transactionId: transaction._id,
+            type: "TRANSFER",
+            direction: "CREDIT",
+            amount,
+            balanceAfter: recipientWallet.balance,
+          },
+        ],
+        { session, ordered: true }
+      );
 
       result = {
         status: 200,
@@ -165,9 +275,315 @@ await LedgerEntry.create(
         },
       };
 
-      // Save the response for safe retries
+      // Save idempotency response.
       await IdempotencyRecord.updateOne(
-        { userId: fromUserId, key: idempotencyKey },
+        {
+          userId: fromUserId,
+          key: idempotencyKey,
+        },
+        {
+          $set: {
+            state: "DONE",
+            responseStatus: result.status,
+            responseBody: result.body,
+          },
+        },
+        { session }
+      );
+    };
+
+    if (ownsSession) {
+      await session.withTransaction(executeTransfer);
+    } else {
+      await executeTransfer();
+    }
+
+    // Cashback runs only after an independently owned transaction.
+    if (rewardData && !skipReward && ownsSession) {
+      await tryCreateRewardCard(rewardData);
+    }
+
+    return result;
+  } finally {
+    if (ownsSession) {
+      await session.endSession();
+    }
+  }
+}
+
+
+
+async function payMoneyRequest({
+  payerId,
+  requestId,
+  idempotencyKey,
+}) {
+  const session = await mongoose.startSession();
+
+  try {
+    let result;
+    let rewardData = null;
+
+    await session.withTransaction(async () => {
+      const requestHash = crypto
+        .createHash("sha256")
+        .update(`REQUEST_PAYMENT:${requestId}`)
+        .digest("hex");
+
+      // Check idempotency first.
+      const existing = await IdempotencyRecord.findOne({
+        userId: payerId,
+        key: idempotencyKey,
+      }).session(session);
+
+      if (existing) {
+        if (existing.requestHash !== requestHash) {
+          const error = new Error(
+            "Idempotency key already used for a different request"
+          );
+          error.status = 409;
+          throw error;
+        }
+
+        if (existing.state === "DONE") {
+          result = {
+            status: existing.responseStatus,
+            body: existing.responseBody,
+          };
+          
+          return;
+        }
+
+        const error = new Error("Request is already being processed");
+        error.status = 409;
+        throw error;
+      }
+
+      const request = await MoneyRequest.findById(requestId)
+        .session(session);
+
+      if (!request) {
+        const error = new Error("Money request not found");
+        error.status = 404;
+        throw error;
+      }
+
+      if (request.requesterId.toString() === payerId.toString()) {
+        const error = new Error("You cannot pay your own request");
+        error.status = 403;
+        throw error;
+      }
+
+      if (request.payerId.toString() !== payerId.toString()) {
+        const error = new Error("You are not authorized to pay this request");
+        error.status = 403;
+        throw error;
+      }
+
+      if (request.status !== "PENDING") {
+        const error = new Error(
+          `Request is already ${request.status}`
+        );
+        error.status = 409;
+        throw error;
+      }
+
+      const now = new Date();
+
+      if (request.expiresAt <= now) {
+        await MoneyRequest.updateOne(
+          { _id: request._id, status: "PENDING" },
+          {
+            $set: {
+              status: "EXPIRED",
+              decidedAt: now,
+            },
+          },
+          { session }
+        );
+
+        result = {
+          status: 410,
+          body: { error: "Money request has expired" },
+        };
+        return;
+      }
+
+      // Atomically claim the request.
+      const paidRequest = await MoneyRequest.findOneAndUpdate(
+        {
+          _id: requestId,
+          payerId,
+          status: "PENDING",
+          expiresAt: { $gt: now },
+        },
+        {
+          $set: {
+            status: "PAID",
+            decidedAt: now,
+          },
+        },
+        {
+          new: true,
+          session,
+        }
+      );
+
+      if (!paidRequest) {
+        const latest = await MoneyRequest.findById(requestId)
+          .session(session);
+
+        if (
+          latest &&
+          latest.status === "PENDING" &&
+          latest.expiresAt <= now
+        ) {
+          await MoneyRequest.updateOne(
+            { _id: requestId, status: "PENDING" },
+            {
+              $set: {
+                status: "EXPIRED",
+                decidedAt: now,
+              },
+            },
+            { session }
+          );
+
+          result = {
+            status: 410,
+            body: { error: "Money request has expired" },
+          };
+          return;
+        }
+
+        const error = new Error("Request is no longer pending");
+        error.status = 409;
+        throw error;
+      }
+
+      // Create idempotency record in the same transaction.
+      await IdempotencyRecord.create(
+        [
+          {
+            userId: payerId,
+            key: idempotencyKey,
+            requestHash,
+            state: "IN_PROGRESS",
+          },
+        ],
+        { session }
+      );
+
+      const amount = paidRequest.amount;
+
+      await reserveDailySpend(payerId, amount, session);
+
+      const payerWallet = await Wallet.findOneAndUpdate(
+        {
+          user: payerId,
+          balance: { $gte: amount },
+        },
+        {
+          $inc: { balance: -amount },
+        },
+        {
+          new: true,
+          session,
+          runValidators: true,
+        }
+      );
+
+      if (!payerWallet) {
+        const error = new Error("Insufficient wallet balance");
+        error.status = 400;
+        throw error;
+      }
+
+      const requesterWallet = await Wallet.findOneAndUpdate(
+        { user: paidRequest.requesterId },
+        {
+          $inc: { balance: amount },
+        },
+        {
+          new: true,
+          session,
+          runValidators: true,
+        }
+      );
+
+      if (!requesterWallet) {
+        const error = new Error("Requester wallet not found");
+        error.status = 404;
+        throw error;
+      }
+
+const [transaction] = await Transaction.create(
+  [
+    {
+      type: "TRANSFER",
+      fromUserId: payerId,
+      toUserId: paidRequest.requesterId,
+      amount,
+      note: `Request: ${paidRequest.note || "Money request"}`.slice(0, 50),
+      status: "SUCCESS",
+    },
+  ],
+  { session }
+);
+
+rewardData = {
+  userId: payerId,
+  receiverId: paidRequest.requesterId,
+  transactionId: transaction._id,
+  amount,
+};
+
+      await LedgerEntry.create(
+        [
+          {
+            userId: payerId,
+            transactionId: transaction._id,
+            type: "TRANSFER",
+            direction: "DEBIT",
+            amount,
+            balanceAfter: payerWallet.balance,
+          },
+          {
+            userId: paidRequest.requesterId,
+            transactionId: transaction._id,
+            type: "TRANSFER",
+            direction: "CREDIT",
+            amount,
+            balanceAfter: requesterWallet.balance,
+          },
+        ],
+        { session, ordered: true }
+      );
+
+      await MoneyRequest.updateOne(
+        { _id: paidRequest._id, status: "PAID" },
+        {
+          $set: { transactionId: transaction._id },
+        },
+        { session }
+      );
+
+      result = {
+        status: 200,
+        body: {
+          message: "Money request paid successfully",
+          transactionId: transaction._id.toString(),
+          requestId: paidRequest._id.toString(),
+          amount,
+          balance: payerWallet.balance,
+        },
+      };
+
+      await IdempotencyRecord.updateOne(
+        {
+          userId: payerId,
+          key: idempotencyKey,
+        },
         {
           $set: {
             state: "DONE",
@@ -179,6 +595,10 @@ await LedgerEntry.create(
       );
     });
 
+    if (rewardData) {
+  await tryCreateRewardCard(rewardData);
+}
+
     return result;
   } finally {
     await session.endSession();
@@ -186,14 +606,22 @@ await LedgerEntry.create(
 }
 
 
+// ================= REQUEST WITHDRAWAL =================
+
 async function requestWithdrawal({
   userId,
   bankAccountId,
   amount,
   idempotencyKey,
 }) {
-  if (!Number.isSafeInteger(amount) || amount < 10000 || amount > 2500000) {
-    const error = new Error("Withdrawal amount must be between ₹100 and ₹25,000");
+  if (
+    !Number.isSafeInteger(amount) ||
+    amount < 10000 ||
+    amount > 2500000
+  ) {
+    const error = new Error(
+      "Withdrawal amount must be between ₹100 and ₹25,000"
+    );
     error.status = 400;
     throw error;
   }
@@ -237,18 +665,22 @@ async function requestWithdrawal({
           return;
         }
 
-        const error = new Error("Request is already being processed");
+        const error = new Error(
+          "Request is already being processed"
+        );
         error.status = 409;
         throw error;
       }
 
       await IdempotencyRecord.create(
-        [{
-          userId,
-          key: idempotencyKey,
-          requestHash,
-          state: "IN_PROGRESS",
-        }],
+        [
+          {
+            userId,
+            key: idempotencyKey,
+            requestHash,
+            state: "IN_PROGRESS",
+          },
+        ],
         { session }
       );
 
@@ -263,12 +695,17 @@ async function requestWithdrawal({
         throw error;
       }
 
+      // Apply the same daily limit used by transfers.
+      await reserveDailySpend(userId, amount, session);
+
       const wallet = await Wallet.findOneAndUpdate(
         {
           user: userId,
           balance: { $gte: amount },
         },
-        { $inc: { balance: -amount } },
+        {
+          $inc: { balance: -amount },
+        },
         {
           new: true,
           session,
@@ -286,48 +723,57 @@ async function requestWithdrawal({
       const reference = `wd_${withdrawalId.toString()}`;
 
       const [withdrawal] = await Withdrawal.create(
-        [{
-          _id: withdrawalId,
-          userId,
-          bankAccountId,
-          amount,
-          reference,
-          status: "PENDING",
-        }],
+        [
+          {
+            _id: withdrawalId,
+            userId,
+            bankAccountId,
+            amount,
+            reference,
+            status: "PENDING",
+          },
+        ],
         { session }
       );
 
       const [transaction] = await Transaction.create(
-        [{
-          type: "WITHDRAWAL",
-          fromUserId: userId,
-          toUserId: null,
-          amount,
-          note: "Bank withdrawal",
-          status: "SUCCESS",
-        }],
+        [
+          {
+            type: "WITHDRAWAL",
+            fromUserId: userId,
+            toUserId: null,
+            amount,
+            note: "Bank withdrawal",
+            status: "SUCCESS",
+          },
+        ],
         { session }
       );
 
       await LedgerEntry.create(
-        [{
-          userId,
-          transactionId: transaction._id,
-          direction: "DEBIT",
-          amount,
-          balanceAfter: wallet.balance,
-        }],
+        [
+          {
+            userId,
+            transactionId: transaction._id,
+            type: "WITHDRAWAL",
+            direction: "DEBIT",
+            amount,
+            balanceAfter: wallet.balance,
+          },
+        ],
         { session }
       );
 
       await OutboxEvent.create(
-        [{
-          type: "PAYOUT_REQUESTED",
-          withdrawalId: withdrawal._id,
-          status: "NEW",
-          attempts: 0,
-          nextAttemptAt: new Date(),
-        }],
+        [
+          {
+            type: "PAYOUT_REQUESTED",
+            withdrawalId: withdrawal._id,
+            status: "NEW",
+            attempts: 0,
+            nextAttemptAt: new Date(),
+          },
+        ],
         { session }
       );
 
@@ -344,7 +790,10 @@ async function requestWithdrawal({
       };
 
       await IdempotencyRecord.updateOne(
-        { userId, key: idempotencyKey },
+        {
+          userId,
+          key: idempotencyKey,
+        },
         {
           $set: {
             state: "DONE",
@@ -362,8 +811,12 @@ async function requestWithdrawal({
   }
 }
 
+// ================= REVERSE WITHDRAWAL =================
 
-async function reverseWithdrawal({ withdrawalId, failureReason }) {
+async function reverseWithdrawal({
+  withdrawalId,
+  failureReason,
+}) {
   const session = await mongoose.startSession();
 
   try {
@@ -378,10 +831,15 @@ async function reverseWithdrawal({ withdrawalId, failureReason }) {
         {
           $set: {
             status: "REVERSED",
-            failureReason: failureReason || "Bank definitively refused payout",
+            failureReason:
+              failureReason ||
+              "Bank definitively refused payout",
           },
         },
-        { new: true, session }
+        {
+          new: true,
+          session,
+        }
       );
 
       if (!withdrawal) {
@@ -394,34 +852,47 @@ async function reverseWithdrawal({ withdrawalId, failureReason }) {
 
       const wallet = await Wallet.findOneAndUpdate(
         { user: withdrawal.userId },
-        { $inc: { balance: withdrawal.amount } },
-        { new: true, session, runValidators: true }
+        {
+          $inc: { balance: withdrawal.amount },
+        },
+        {
+          new: true,
+          session,
+          runValidators: true,
+        }
       );
 
       if (!wallet) {
-        throw new Error("Wallet not found for withdrawal reversal");
+        throw new Error(
+          "Wallet not found for withdrawal reversal"
+        );
       }
 
       const [transaction] = await Transaction.create(
-        [{
-          type: "REVERSAL",
-          fromUserId: null,
-          toUserId: withdrawal.userId,
-          amount: withdrawal.amount,
-          note: "Bank withdrawal refund",
-          status: "SUCCESS",
-        }],
+        [
+          {
+            type: "REVERSAL",
+            fromUserId: null,
+            toUserId: withdrawal.userId,
+            amount: withdrawal.amount,
+            note: "Bank withdrawal refund",
+            status: "SUCCESS",
+          },
+        ],
         { session }
       );
 
       await LedgerEntry.create(
-        [{
-          userId: withdrawal.userId,
-          transactionId: transaction._id,
-          direction: "CREDIT",
-          amount: withdrawal.amount,
-          balanceAfter: wallet.balance,
-        }],
+        [
+          {
+            userId: withdrawal.userId,
+            transactionId: transaction._id,
+            type: "REVERSAL",
+            direction: "CREDIT",
+            amount: withdrawal.amount,
+            balanceAfter: wallet.balance,
+          },
+        ],
         { session }
       );
 
@@ -450,10 +921,9 @@ async function reverseWithdrawal({ withdrawalId, failureReason }) {
   }
 }
 
-
 module.exports = {
   transferMoney,
   requestWithdrawal,
   reverseWithdrawal,
+  payMoneyRequest,
 };
-

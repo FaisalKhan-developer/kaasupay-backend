@@ -7,16 +7,33 @@ const transactionsRouter = require("./transactions");
 const adminRouter = require("./admin");
 const walletRouter = require("./wallet");
 const withdrawalsRouter = require("./withdrawals");
-
+const requestsRouter = require("./requests");
+const rewardsRouter = require("./rewards");
+const autopayRouter = require("./autopay");
+const cronRouter = require("./cron");
 const router = express.Router();
 
+// User routes
 router.use("/user", userRouter);
+
+// Admin routes
 router.use("/admin", adminRouter);
 
-// Wallet endpoints
+// Wallet routes
 router.use("/wallet", walletRouter);
 router.use("/wallet/transactions", transactionsRouter);
 router.use("/wallet/add-money", addMoneyRouter);
+
+// Withdrawal and bank account routes
 router.use("/wallet", withdrawalsRouter);
+
+// Request Money routes
+router.use("/requests", requestsRouter);
+
+router.use("/rewards", rewardsRouter);
+
+router.use("/autopay", autopayRouter);
+
+router.use("/cron", cronRouter);
 
 module.exports = router;

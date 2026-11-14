@@ -2,38 +2,85 @@
 const express = require("express");
 const mongoose = require("mongoose");
 const jwt = require("jsonwebtoken");
+
 const { JWT_SECRET } = require("../config");
 
+const User = require("../models/User");
 const BankAccount = require("../models/bankAccount");
 const Withdrawal = require("../models/Withdrawal");
+
 const { requestWithdrawal } = require("../services/money");
+const { checkPin } = require("../services/pin");
+const { createRateLimiter } = require("../middleware/rateLimiter");
 
 const router = express.Router();
-function authenticateToken(req, res, next) {
+
+// ================= RATE LIMITER =================
+
+const moneyLimiter = createRateLimiter({
+  keyGenerator: (req) => `money:${req.user.userId}`,
+  limit: 10,
+  windowMs: 60 * 1000,
+});
+
+// ================= AUTHENTICATION =================
+
+async function authenticateToken(req, res, next) {
   const authHeader = req.headers.authorization;
 
   if (!authHeader || !authHeader.startsWith("Bearer ")) {
-    return res.status(401).json({ error: "Missing authentication token" });
+    return res.status(401).json({
+      error: "Missing authentication token",
+    });
   }
 
   try {
     const decoded = jwt.verify(authHeader.slice(7), JWT_SECRET);
-    req.user = { userId: decoded.userId };
+
+    const user = await User.findById(decoded.userId).select(
+      "tokenVersion"
+    );
+
+    if (!user) {
+      return res.status(401).json({
+        error: "User not found",
+      });
+    }
+
+    if ((decoded.tv ?? 0) !== (user.tokenVersion ?? 0)) {
+      return res.status(401).json({
+        error: "Session expired. Please log in again.",
+      });
+    }
+
+    req.user = {
+      userId: user._id.toString(),
+    };
+
     next();
   } catch (error) {
-    return res.status(401).json({ error: "Invalid or expired token" });
+    if (
+      error.name === "JsonWebTokenError" ||
+      error.name === "TokenExpiredError"
+    ) {
+      return res.status(401).json({
+        error: "Invalid or expired token",
+      });
+    }
+
+    console.error("Authentication error:", error);
+
+    return res.status(500).json({
+      error: "Authentication failed",
+    });
   }
 }
 
-// Save a bank account
-router.post("/bank-accounts", async (req, res) => {
+// ================= SAVE BANK ACCOUNT =================
+
+router.post("/bank-accounts", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user?.userId || req.user?.id || req.user?._id;
-
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
+    const userId = req.user.userId;
     const { holderName, accountNumber, ifsc } = req.body;
 
     if (
@@ -87,118 +134,173 @@ router.post("/bank-accounts", async (req, res) => {
     }
 
     console.error("Save bank account error:", error);
-    return res.status(500).json({ error: "Unable to save bank account" });
+
+    return res.status(500).json({
+      error: "Unable to save bank account",
+    });
   }
 });
 
-// List the logged-in user's bank accounts
+// ================= LIST BANK ACCOUNTS =================
+
 router.get("/bank-accounts", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user?.userId || req.user?.id || req.user?._id;
+    const accounts = await BankAccount.find({
+      userId: req.user.userId,
+    }).select("holderName last4 ifsc createdAt");
 
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    const accounts = await BankAccount.find({ userId }).select(
-      "holderName last4 ifsc createdAt"
-    );
-
-    return res.json({ bankAccounts: accounts });
+    return res.json({
+      bankAccounts: accounts,
+    });
   } catch (error) {
     console.error("List bank accounts error:", error);
-    return res.status(500).json({ error: "Unable to list bank accounts" });
+
+    return res.status(500).json({
+      error: "Unable to list bank accounts",
+    });
   }
 });
 
-// Request a withdrawal
-router.post("/bank-accounts", authenticateToken, async (req, res) => {
-  try {
-    const userId = req.user?.userId || req.user?.id || req.user?._id;
+// ================= REQUEST WITHDRAWAL =================
 
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
+router.post(
+  "/withdrawals",
+  authenticateToken,
+  moneyLimiter,
+  async (req, res) => {
+    try {
+      const userId = req.user.userId;
+      const { bankAccountId, amount, pin } = req.body;
 
-    const { bankAccountId, amount } = req.body;
-    const idempotencyKey = req.get("Idempotency-Key");
+      if (!mongoose.isValidObjectId(bankAccountId)) {
+        return res.status(400).json({
+          error: "Valid bankAccountId is required",
+        });
+      }
 
-    if (!mongoose.isValidObjectId(bankAccountId)) {
-      return res.status(400).json({ error: "Valid bankAccountId is required" });
-    }
+      if (
+        !Number.isSafeInteger(amount) ||
+        amount < 10000 ||
+        amount > 2500000
+      ) {
+        return res.status(400).json({
+          error: "Amount must be between ₹100 and ₹25,000",
+        });
+      }
 
-    if (!Number.isSafeInteger(amount)) {
-      return res.status(400).json({
-        error: "Amount must be a whole number in paise",
+      const idempotencyKey = req.get("Idempotency-Key");
+
+      if (
+        typeof idempotencyKey !== "string" ||
+        idempotencyKey.trim().length < 8 ||
+        idempotencyKey.length > 128
+      ) {
+        return res.status(400).json({
+          error: "Provide an Idempotency-Key header (8-128 characters)",
+        });
+      }
+
+      if (
+        typeof pin !== "string" ||
+        !/^\d{4}(?:\d{2})?$/.test(pin)
+      ) {
+        return res.status(400).json({
+          error: "PIN must contain exactly 4 or 6 digits",
+        });
+      }
+
+      const pinResult = await checkPin(userId, pin);
+
+      if (!pinResult.ok) {
+        if (pinResult.retryAfter) {
+          res.set("Retry-After", String(pinResult.retryAfter));
+        }
+
+        return res.status(pinResult.status).json({
+          error: pinResult.error,
+          ...(pinResult.attemptsRemaining !== undefined && {
+            attemptsRemaining: pinResult.attemptsRemaining,
+          }),
+        });
+      }
+
+      const result = await requestWithdrawal({
+        userId,
+        bankAccountId,
+        amount,
+        idempotencyKey: idempotencyKey.trim(),
+      });
+
+      return res.status(result.status).json(result.body);
+    } catch (error) {
+      console.error("Request withdrawal error:", error);
+
+      return res.status(error.status || 500).json({
+        error: error.status
+          ? error.message
+          : "Unable to request withdrawal",
       });
     }
-
-    const result = await requestWithdrawal({
-      userId,
-      bankAccountId,
-      amount,
-      idempotencyKey,
-    });
-
-    return res.status(result.status).json(result.body);
-  } catch (error) {
-    console.error("Request withdrawal error:", error);
-    return res.status(error.status || 500).json({
-      error: error.status ? error.message : "Unable to request withdrawal",
-    });
   }
-});
+);
 
-// List the logged-in user's withdrawals
+// ================= WITHDRAWAL HISTORY =================
+
 router.get("/withdrawals", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user?.userId || req.user?.id || req.user?._id;
-
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
-    const withdrawals = await Withdrawal.find({ userId })
+    const withdrawals = await Withdrawal.find({
+      userId: req.user.userId,
+    })
       .select("-__v")
       .sort({ createdAt: -1 })
       .limit(50);
 
-    return res.json({ withdrawals });
+    return res.json({
+      withdrawals,
+    });
   } catch (error) {
     console.error("List withdrawals error:", error);
-    return res.status(500).json({ error: "Unable to list withdrawals" });
+
+    return res.status(500).json({
+      error: "Unable to list withdrawals",
+    });
   }
 });
 
-// Get one withdrawal
+// ================= SINGLE WITHDRAWAL =================
+
 router.get("/withdrawals/:id", authenticateToken, async (req, res) => {
   try {
-    const userId = req.user?.userId || req.user?.id || req.user?._id;
-
-    if (!userId) {
-      return res.status(401).json({ error: "Unauthorized" });
-    }
-
     if (!mongoose.isValidObjectId(req.params.id)) {
-      return res.status(400).json({ error: "Invalid withdrawal ID" });
+      return res.status(400).json({
+        error: "Invalid withdrawal ID",
+      });
     }
 
     const withdrawal = await Withdrawal.findOne({
       _id: req.params.id,
-      userId,
+      userId: req.user.userId,
     }).select("-__v");
 
     if (!withdrawal) {
-      return res.status(404).json({ error: "Withdrawal not found" });
+      return res.status(404).json({
+        error: "Withdrawal not found",
+      });
     }
 
-    return res.json({ withdrawal });
+    return res.json({
+      withdrawal,
+    });
   } catch (error) {
     console.error("Get withdrawal error:", error);
-    return res.status(500).json({ error: "Unable to get withdrawal" });
+
+    return res.status(500).json({
+      error: "Unable to get withdrawal",
+    });
   }
 });
 
+// ================= ADMIN WITHDRAWAL REVIEW =================
 
 router.get("/admin/withdrawals", async (req, res) => {
   const adminKey = process.env.ADMIN_KEY;
@@ -208,7 +310,9 @@ router.get("/admin/withdrawals", async (req, res) => {
     typeof req.get("x-admin-key") !== "string" ||
     req.get("x-admin-key") !== adminKey
   ) {
-    return res.status(401).json({ error: "Staff only" });
+    return res.status(401).json({
+      error: "Staff only",
+    });
   }
 
   try {
@@ -223,7 +327,9 @@ router.get("/admin/withdrawals", async (req, res) => {
     ];
 
     if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({ error: "Invalid withdrawal status" });
+      return res.status(400).json({
+        error: "Invalid withdrawal status",
+      });
     }
 
     const withdrawals = await Withdrawal.find({ status })
@@ -231,56 +337,16 @@ router.get("/admin/withdrawals", async (req, res) => {
       .sort({ createdAt: -1 })
       .limit(100);
 
-    return res.json({ withdrawals });
+    return res.json({
+      withdrawals,
+    });
   } catch (error) {
     console.error("Admin withdrawal review error:", error);
+
     return res.status(500).json({
       error: "Unable to retrieve withdrawals",
     });
   }
 });
-
-
-router.get("/admin/withdrawals", async (req, res) => {
-  const adminKey = process.env.ADMIN_KEY;
-
-  if (
-    !adminKey ||
-    typeof req.get("x-admin-key") !== "string" ||
-    req.get("x-admin-key") !== adminKey
-  ) {
-    return res.status(401).json({ error: "Staff only" });
-  }
-
-  try {
-    const status = req.query.status || "NEEDS_REVIEW";
-
-    const allowedStatuses = [
-      "PENDING",
-      "PROCESSING",
-      "SUCCESS",
-      "REVERSED",
-      "NEEDS_REVIEW",
-    ];
-
-    if (!allowedStatuses.includes(status)) {
-      return res.status(400).json({ error: "Invalid withdrawal status" });
-    }
-
-    const withdrawals = await Withdrawal.find({ status })
-      .select("-__v")
-      .sort({ createdAt: -1 })
-      .limit(100);
-
-    return res.json({ withdrawals });
-  } catch (error) {
-    console.error("Admin withdrawal review error:", error);
-    return res.status(500).json({
-      error: "Unable to retrieve withdrawals",
-    });
-  }
-});
-
-
 
 module.exports = router;

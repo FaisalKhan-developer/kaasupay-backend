@@ -5,7 +5,14 @@ const transactionSchema = new mongoose.Schema(
   {
     type: {
       type: String,
-      enum: ["DEPOSIT", "TRANSFER", "TOPUP", "WITHDRAWAL", "REVERSAL"],
+      enum: [
+  "DEPOSIT",
+  "TRANSFER",
+  "TOPUP",
+  "WITHDRAWAL",
+  "REVERSAL",
+  "CASHBACK",
+],
       required: true,
     },
     fromUserId: {

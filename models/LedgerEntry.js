@@ -13,6 +13,18 @@ const ledgerEntrySchema = new mongoose.Schema(
       ref: "Transaction",
       required: true,
     },
+    type: {
+      type: String,
+enum: [
+  "TRANSFER",
+  "DEPOSIT",
+  "TOPUP",
+  "WITHDRAWAL",
+  "REVERSAL",
+  "CASHBACK",
+],
+      required: true,
+    },
     direction: {
       type: String,
       enum: ["DEBIT", "CREDIT"],
@@ -42,7 +54,19 @@ const ledgerEntrySchema = new mongoose.Schema(
   }
 );
 
-// Helps fetch a user's latest transactions efficiently
-ledgerEntrySchema.index({ userId: 1, createdAt: -1 });
+// Day 8: Cursor pagination index
+ledgerEntrySchema.index({
+  userId: 1,
+  createdAt: -1,
+  _id: -1,
+});
+
+// Day 8: Type-filtered history index
+ledgerEntrySchema.index({
+  userId: 1,
+  type: 1,
+  createdAt: -1,
+  _id: -1,
+});
 
 module.exports = mongoose.model("LedgerEntry", ledgerEntrySchema);
